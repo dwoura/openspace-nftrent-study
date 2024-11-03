@@ -6,7 +6,9 @@ import "@openzeppelin/contracts/token/ERC721/extensions/ERC721Enumerable.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
+import {console} from "forge-std/Test.sol";
 /**
  * @title RenftMarket
  * @dev NFT租赁市场合约
@@ -34,12 +36,12 @@ contract RenftMarket is EIP712 {
       RentoutOrder rentinfo; // 租赁订单
    }
 
-   //mapping(uint256 => BorrowOrder) public orders; // id->border 已租赁订单
-   mapping(bytes32 => BorrowOrder) public orders; // 已租赁订单
+   uint256 precision = 10e10;
+
+   mapping(bytes32 => BorrowOrder) public orders; // 已租赁订单 rOrder->bOrder
    mapping(bytes32 => bool) public canceledOrders; // 已取消的挂单
 
-   // mapping(address=>uint) collaterals; // nums of collateralized eth
-   uint8 COLLATERAL_LIQUIDATION = -1;
+   mapping(bytes32 => uint256) lastWithrawTime; // 上次取租金的时间
 
    bytes32 public constant RENTOUT_ORDER_TYPE_HASH = keccak256("RentoutOrder(address maker,address nft_ca,uint256 token_id,uint256 daily_rent,uint256 max_rental_duration,uint256 min_collateral,uint256 list_endtime)");
 
@@ -48,41 +50,45 @@ contract RenftMarket is EIP712 {
    // 取消订单事件
    event OrderCanceled(address indexed maker, bytes32 orderHash);
    // 归还事件
-   event ReturnNft(address indexed taker, bytes32 orderHash);
+   event ReturnNft(bytes32 indexed orderHash, address indexed taker);
    // 提款事件
-   event RentWithdrawn(address indexed maker, uint256 amount); 
+   event RentWithdrawn(bytes32 indexed orderHash,address indexed maker, uint256 amount); 
    // 清算事件
-   event Liquidation(bytes32 indexed orderHash, address taker, uint256 collateral);
+   event Liquidation(bytes32 indexed orderHash, address indexed taker, uint256 collateral);
    constructor() EIP712("RenftMarket", "1") {}
+
+   function verifySignature(bytes32 hash, bytes memory signature) public pure returns (address) {
+      return ECDSA.recover(hash, signature);
+   }
 
    /**
    * @notice 租赁NFT
    * @dev 验证签名后，将NFT从出租人转移到租户，并存储订单信息
    */
    function borrow(RentoutOrder calldata order, bytes calldata makerSignature) external payable {
-      require( block.timestamp < order.list_endtime, "order expired");
-      require(msg.value >= order.min_collateral, "eth balance not enough");
+      require(block.timestamp < order.list_endtime, "order expired");
+      require(msg.value >= order.min_collateral, "value eth not enough");
 
       bytes32 digest = orderHash(order);
-      address recoveredAddr = ECDSA.recover(digest, signature);
+      require(canceledOrders[digest] == false,"order has been canceled");
+      address signer = verifySignature(digest, makerSignature);
       
       // to verify signature and the rent-out order message, which is actually be published by lesser 
-      require(order.maker == recoveredAddr);
+      require(order.maker == signer,"wrong signature");
 
-      // transfer nft from lesser to lessee
+      // transfer nft from maker to taker
       IERC721 nft = IERC721(order.nft_ca);
-      require(address(this) == nft.getApproved(tokenId), "nft not be approve for market");
-      nft.safeTransferFrom(order.maker, msg.sender, tokenId);
+      require(address(this) == nft.getApproved(order.token_id), "nft not be approved for market");
+      nft.safeTransferFrom(order.maker, msg.sender, order.token_id);
 
       // update info
-      //collaterals[msg.sender] = msg.value;
       orders[digest] = BorrowOrder({
          taker: msg.sender,
          collateral: msg.value,
          start_time: block.timestamp,
          rentinfo: order
       });
-      lastWithdrawTime[digest] = block.timestamp; // 更新maker计算租金的起始时间
+      lastWithrawTime[digest] = block.timestamp;
 
       // emit event
       emit BorrowNFT(msg.sender, order.maker, digest, order.min_collateral);
@@ -92,23 +98,23 @@ contract RenftMarket is EIP712 {
    * 1. 取消时一定要将取消的信息在链上标记，防止订单被使用！
    * 2. 防DOS： 取消订单有成本，这样防止随意的挂单，
    */
-   function cancelOrder(RentoutOrder calldata order, bytes calldata makerSignatre) external {
-      bytes digest = orderHash(order);
-      address signer = ECDSA.recover(digest, makerSignature);
+   function cancelOrder(RentoutOrder calldata order, bytes calldata makerSignature) external {
+      bytes32 digest = orderHash(order);
+      address signer = verifySignature(digest, makerSignature);
+
       require(msg.sender == signer, "only signer can cancel the order");
-      
       require(!canceledOrders[digest], "order has been canceled");
 
       canceledOrders[digest] = true;
 
-      emit OrderCanceled(order.maker, orderHash);
+      emit OrderCanceled(order.maker, digest);
    }
 
    // 计算订单哈希
-   function orderHash(RentoutOrder calldata order) public view returns (bytes32) {
+   function orderHash(RentoutOrder memory order) public view returns (bytes32) {
       // RentoutOrder digest
       bytes32 digest = _hashTypedDataV4(keccak256(abi.encode(
-         RENT_OUT_ORDER_TYPE_HASH,
+            RENTOUT_ORDER_TYPE_HASH,
             order.maker,
             order.nft_ca,
             order.token_id,
@@ -120,38 +126,45 @@ contract RenftMarket is EIP712 {
       return digest;
    }
 
-   function computeRent(BorrowOrder bOrder) public view returns(uint256 rent){
+   function computeRent(bytes32 rOrderHash) public view returns(bool,uint256){
+      BorrowOrder memory bOrder = orders[rOrderHash];
+      uint256 lastWithdrawTime =  lastWithrawTime[rOrderHash];
       uint256 startTime = bOrder.start_time;
       uint256 maxDuration = bOrder.rentinfo.max_rental_duration;
-      uint256 rentPerSecond = bOrder.rentinfo.daily_rent / 1 days; // 每秒租金
+      uint256 rentPerSecond = Math.ceilDiv(bOrder.rentinfo.daily_rent * precision, 1 days); // 每秒租金 todo: 直接整除有精度问题！！
 
-      if(block.timestamp - bOrder.start_time > bOrder.rentinfo.max_rental_duration){
-         // return max rent when overdue
-         return COLLATERAL_LIQUIDATION;
+      uint256 rentedSecond = block.timestamp - lastWithdrawTime;// 未收取租金的时间段
+      uint256 realizedRent =  (lastWithdrawTime - startTime) * rentPerSecond;
+      uint256 rent = rentedSecond * rentPerSecond / precision; // 精度处理
+      if( block.timestamp > (startTime + maxDuration) || (rent + realizedRent) > bOrder.collateral ){
+         // return max rent when overdue or over the rent
+         bool isLiquidate = true;
+         return (isLiquidate, bOrder.collateral); // max rent is collateral
       }
 
-      uint256 rentedSecond = block.timestamp - startTime;// 未收取租金的时间段
-      rent = rentedSecond * rentPerSecond;
+      return (false,rent);
    }
 
-   function liquidateNft(BorrowOrder bOrder) internal{
+   function liquidateNft(BorrowOrder memory bOrder) internal{
       // 清算抵押物，抵押物
       payable(bOrder.rentinfo.maker).transfer(bOrder.collateral);
 
-      emit Liquidation(borrowOrderHash, bOrder.taker, bOrder.collateral);
+      bytes32 digest = orderHash(bOrder.rentinfo);
+
+      emit Liquidation(digest, bOrder.taker, bOrder.collateral);
    }
 
    // return nft by taker
-   function returnNft(bytes32 borrowOrderHash) public {
-      BorrowOrder bOrder = orders[borrowOrderHash];
-      require(bOrder, "order not exist");
+   function returnNft(bytes32 rOrderHash) public {
+      BorrowOrder memory bOrder = orders[rOrderHash];
+      require(bOrder.taker != address(0), "order not exist");
       require(msg.sender == bOrder.taker, "only taker of nft can return");
 
       // check rent value and collateral value
-      uint rent = computeRent(bOrder);
-      if(rent == COLLATERAL_LIQUIDATION){
+      (bool isLiquidate,uint rent) = computeRent(rOrderHash);
+      if(isLiquidate == true){
          // liquidate
-         liquidate(bOrder);
+         liquidateNft(bOrder);
          return;
       }
 
@@ -159,43 +172,54 @@ contract RenftMarket is EIP712 {
       payable(bOrder.rentinfo.maker).transfer(rent);
 
       IERC721 nft = IERC721(bOrder.rentinfo.nft_ca);
-      require(address(this) == nft.getApproved(bOrder.rentinfo.token_id), "market not be approved");
-      nft.safeTransferFrom(msg.sender, bOrder.rentinfo.maker, tokenId);
+      require(address(this) == nft.getApproved(bOrder.rentinfo.token_id), "market needs to be approved");
+      nft.safeTransferFrom(msg.sender, bOrder.rentinfo.maker, bOrder.rentinfo.token_id);
 
-      // 2. return remaining collateral
+      // 2. return remaining collateral to taker
       uint256 rentPerSecond = bOrder.rentinfo.daily_rent / 1 days;
-      uint refund = bOrder.rentinfo.max_rental_duration * rentPerSecond;
+      uint refund = bOrder.collateral - (block.timestamp - bOrder.start_time ) * rentPerSecond;
       // send refund
       payable(msg.sender).transfer(refund);
 
       // remove the order
-      delete orders[borrowOrderHash];
+      delete orders[rOrderHash];
 
-      emit ReturnNft(msg.sender, borrowOrderHash);
+      emit ReturnNft(rOrderHash,msg.sender);
    }
 
    // rent withdraw
-   function rentWithdraw(bytes32 borrowOrderHash) public {
-      BorrowOrder bOrder = orders[borrowOrderHash];
-      require(bOrder, "order not exist");
+   function rentWithdraw(bytes32 rOrderHash) public returns(uint256){
+      BorrowOrder storage bOrder = orders[rOrderHash];
+      require(bOrder.taker != address(0), "order not exist");
       require(msg.sender == bOrder.rentinfo.maker, "only order maker can do this");
       
       // check rent value and collateral value
-      uint rent = computeRent(bOrder);
-      if(rent == COLLATERAL_LIQUIDATION){
+      (bool isLiquidate,uint rent) = computeRent(rOrderHash);
+      if(isLiquidate == true){
          // liquidate
-         liquidate(bOrder);
-         return;
+         liquidateNft(bOrder);
+         return 0;
       }
 
       payable(msg.sender).transfer(rent);
 
-      // update maxDuration and rent startTime
-      // startTime↑, maxDuration↓, the sum is constant
-      bOrder.rentinfo.max_rental_duration -= block.timestamp - bOrder.start_time;
-      bOrder.start_time = block.timestamp;
+      // update last withdraw time
+      lastWithrawTime[rOrderHash] = block.timestamp;
 
-      emit RentWithdrawn(msg.sender, rent);
+      emit RentWithdrawn(rOrderHash,msg.sender, rent);
+      return rent;
+   }
+
+   function hashTypedDataV4(bytes32 structHash) public view returns(bytes32 digest){
+      digest = _hashTypedDataV4(structHash);
+   }
+
+   function Rentout_Order_Type_Hash() public pure returns(bytes32){
+      return RENTOUT_ORDER_TYPE_HASH;
+   }
+
+   function getOrders(bytes32 rOrderHash) public view returns(BorrowOrder memory){
+      return orders[rOrderHash];
    }
 
 }
